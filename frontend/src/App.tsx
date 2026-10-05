@@ -114,6 +114,9 @@ function App() {
   const [toast, setToast] = useState('')
   const [currentUser, setCurrentUser] = useState<User>(USERS[0])
   const [showUserMenu, setShowUserMenu] = useState(false)
+  const [lockedCards, setLockedCards] = useState<Set<string>>(new Set())
+  const [stepUpModalCase, setStepUpModalCase] = useState<FraudCase | null>(null)
+  const [fraudConfirmModalCase, setFraudConfirmModalCase] = useState<FraudCase | null>(null)
 
   useEffect(() => {
     let mounted = true
@@ -157,16 +160,20 @@ function App() {
     return matchesRisk && matchesStatus && matchesSearch
   }), [cases, riskFilter, statusFilter, search])
 
-  const datasetEvents = useMemo(() => cases.slice().sort((a, b) => b.timestamp.localeCompare(a.timestamp)).map((item) => ({
-    id: item.id,
-    time: item.time,
-    merchant: item.merchant,
-    amount: formatCurrency(item.amount),
-    location: item.location,
-    score: item.risk,
-    label: item.status === 'Cleared' ? 'OBSERVED' : item.status === 'Needs review' ? 'REVIEW' : 'FLAGGED',
-    tone: item.status === 'Cleared' ? 'positive' as const : item.risk >= 75 ? 'danger' as const : 'warning' as const,
-  })), [cases])
+  const datasetEvents = useMemo(() => cases.slice().sort((a, b) => b.timestamp.localeCompare(a.timestamp)).map((item) => {
+    const isLocked = lockedCards.has(item.card)
+    return {
+      id: item.id,
+      card: item.card,
+      time: item.time,
+      merchant: item.merchant,
+      amount: formatCurrency(item.amount),
+      location: item.location,
+      score: item.risk,
+      label: isLocked ? 'BLOCKED' : item.status === 'Cleared' ? 'OBSERVED' : item.status === 'Needs review' ? 'REVIEW' : 'FLAGGED',
+      tone: isLocked ? 'danger' as const : item.status === 'Cleared' ? 'positive' as const : item.risk >= 75 ? 'danger' as const : 'warning' as const,
+    }
+  }), [cases, lockedCards])
   const visibleEvents = useMemo(() => {
     if (!datasetEvents.length) return []
     const offset = liveTick % datasetEvents.length
@@ -222,12 +229,46 @@ function App() {
   }
 
   const handleSelectCase = (item: FraudCase) => setSelectedId(item.id)
-  const handleClearAlert = () => updateSelectedCase('Cleared', 'Alert cleared · case marked resolved', 'Alert cleared', 'positive', { remediation: undefined })
-  const handleLockCard = () => updateSelectedCase('Escalated', 'Card locked · transaction activity blocked', 'Card locked', 'danger', { remediation: 'Card locked' })
-  const handleStepUp = () => updateSelectedCase('Needs review', 'Step-up authentication required · case held for verification', 'Step-up requested', 'warning', { remediation: 'Step-up authentication required' })
+  
+  const handleClearAlert = () => {
+    updateSelectedCase('Cleared', 'Alert cleared · case marked resolved', 'Alert cleared', 'positive', { remediation: undefined })
+    setSelectedId(null)
+  }
+  
+  const handleLockCard = () => {
+    if (!selectedCase) return
+    setLockedCards(prev => new Set(prev).add(selectedCase.card))
+    updateSelectedCase('Escalated', 'Card locked · transaction activity blocked', 'Card locked', 'danger', { remediation: 'Card locked' })
+  }
+  
+  const handleStepUp = () => {
+    if (!selectedCase) return
+    setStepUpModalCase(selectedCase)
+  }
+  
+  const submitStepUp = (method: string) => {
+    updateSelectedCase('Needs review', `Step-up authentication sent via ${method}`, 'Step-up requested', 'warning', { remediation: 'Step-up authentication required' })
+    setStepUpModalCase(null)
+  }
+
   const handleFeedback = (kind: 'Confirmed fraud' | 'False positive' | 'Needs review') => {
+    if (kind === 'Confirmed fraud' && currentUser.role !== 'L1 Analyst' && !lockedCards.has(selectedCase!.card)) {
+      setFraudConfirmModalCase(selectedCase)
+      return
+    }
     const status = kind === 'False positive' ? 'Cleared' : kind === 'Confirmed fraud' ? 'Escalated' : 'Needs review'
     updateSelectedCase(status, `Feedback recorded · ${kind.toLowerCase()}`, 'Analyst feedback', kind === 'False positive' ? 'positive' : kind === 'Confirmed fraud' ? 'danger' : 'warning', { feedback: kind, remediation: undefined })
+    if (kind === 'False positive') setSelectedId(null)
+  }
+
+  const submitFraudConfirm = (lockCard: boolean) => {
+    if (lockCard && fraudConfirmModalCase) {
+      setLockedCards(prev => new Set(prev).add(fraudConfirmModalCase.card))
+      updateSelectedCase('Escalated', 'Feedback recorded · confirmed fraud and card locked', 'Analyst feedback', 'danger', { feedback: 'Confirmed fraud', remediation: 'Card locked' })
+    } else {
+      updateSelectedCase('Escalated', 'Feedback recorded · confirmed fraud', 'Analyst feedback', 'danger', { feedback: 'Confirmed fraud', remediation: undefined })
+    }
+    setFraudConfirmModalCase(null)
   }
   const handleExportReport = () => {
     if (!dataset) return
@@ -369,6 +410,40 @@ function App() {
         <div className="main-scroll">{activeView === 'overview' ? renderOverview() : activeView === 'cases' ? renderCases() : activeView === 'analytics' ? renderAnalytics() : renderAudit()}</div>
       </main>
       {selectedCase && <div className="drawer-backdrop" onClick={() => setSelectedId(null)}><aside className="case-drawer" onClick={(event) => event.stopPropagation()}><div className="drawer-header"><div><span className="eyebrow">Case detail / {selectedCase.id}</span><h2>{selectedCase.merchant}</h2><span className="drawer-subtitle">{selectedCase.category} · {selectedCase.time} UTC</span>{(selectedCase.remediation || selectedCase.feedback || selectedCase.status) && <div className="drawer-action-state"><strong>Current state</strong><span>{selectedCase.remediation ?? selectedCase.feedback ?? selectedCase.status}</span></div>}</div><button className="icon-button" aria-label="Close case detail" onClick={() => setSelectedId(null)}><Icon name="close" size={18} /></button></div><div className="drawer-score-block"><div className="score-ring" style={{ background: `conic-gradient(#ff6d70 ${selectedCase.risk * 3.6}deg, #252b32 0deg)` }}><div><strong>{selectedCase.risk}</strong><span>/ 100</span></div></div><div><RiskBadge score={selectedCase.risk} /><p>{selectedCase.reason}</p><span className="confidence">Model confidence <strong>{selectedCase.modelConfidence}%</strong></span></div></div><div className="drawer-context"><div><span>Card</span><strong>{selectedCase.card}</strong></div><div><span>Amount</span><strong>{formatCurrency(selectedCase.amount)}</strong></div><div><span>Location</span><strong>{selectedCase.location}</strong></div><div><span>Velocity</span><strong>{selectedCase.velocity}</strong></div></div><div className="drawer-section"><div className="drawer-section-title"><span className="eyebrow">Explainability</span><span>feature contribution</span></div><div className="drawer-signals">{selectedCase.features.map((feature) => <div className="drawer-signal" key={feature.label}><div><span>{feature.label}</span><strong>{feature.value}</strong></div><div className="signal-track"><span className={`signal-fill fill-${feature.tone === 'danger' ? 'coral' : feature.tone === 'warning' ? 'amber' : feature.tone === 'positive' ? 'mint' : 'slate'}`} style={{ width: `${feature.weight}%` }} /></div></div>)}</div></div><div className="drawer-actions"><span className="eyebrow">Remediation</span><div className="action-grid"><button className="danger-button" onClick={handleLockCard} disabled={!canLockCard || selectedCase.remediation === 'Card locked' || selectedCase.status === 'Cleared'} title={!canLockCard ? "Requires Admin role" : ""}><Icon name="lock" size={15} />{selectedCase.remediation === 'Card locked' ? 'Card locked' : 'Lock card'}</button><button className="warning-button" onClick={handleStepUp} disabled={!canStepUp || selectedCase.remediation === 'Step-up authentication required' || selectedCase.status === 'Cleared'} title={!canStepUp ? "Requires L2 Analyst or Admin role" : ""}><Icon name="shield" size={15} />{selectedCase.remediation === 'Step-up authentication required' ? 'Step-up pending' : 'Step-up auth'}</button></div><button className="clear-button" onClick={handleClearAlert} disabled={!canClearAlert || selectedCase.status === 'Cleared'} title={!canClearAlert ? "Requires L2 Analyst or Admin role" : ""}><Icon name="check" size={15} />{selectedCase.status === 'Cleared' ? 'Alert cleared' : 'Clear this alert'}</button></div><div className="drawer-feedback"><span className="eyebrow">Analyst feedback</span><div><button className={selectedCase.feedback === 'Confirmed fraud' ? 'is-selected' : ''} onClick={() => handleFeedback('Confirmed fraud')} disabled={!canConfirmFraud} title={!canConfirmFraud ? "Requires L2 Analyst or Admin role" : ""}>Confirmed fraud</button><button className={selectedCase.feedback === 'False positive' ? 'is-selected' : ''} onClick={() => handleFeedback('False positive')}>False positive</button><button className={selectedCase.feedback === 'Needs review' ? 'is-selected' : ''} onClick={() => handleFeedback('Needs review')}>Needs review</button></div></div></aside></div>}
+      {stepUpModalCase && (
+        <div className="drawer-backdrop" style={{ zIndex: 50, alignItems: 'center', justifyContent: 'center' }}>
+          <div className="panel" style={{ width: '400px', padding: '24px', animation: 'drawer-in 0.2s ease', position: 'relative' }}>
+            <h3 style={{ margin: '0 0 10px', fontSize: '16px' }}>Step-up Authentication</h3>
+            <p style={{ color: 'var(--muted)', fontSize: '12px', marginBottom: '20px', lineHeight: 1.5 }}>
+              Select a verification method to challenge the customer for this transaction at <strong>{stepUpModalCase.merchant}</strong>.
+            </p>
+            <div style={{ display: 'grid', gap: '10px', marginBottom: '20px' }}>
+              <button className="clear-button" onClick={() => submitStepUp('SMS OTP')} style={{ margin: 0 }}>Send SMS OTP</button>
+              <button className="clear-button" onClick={() => submitStepUp('Push Notification')} style={{ margin: 0 }}>In-App Push Notification</button>
+              <button className="clear-button" onClick={() => submitStepUp('3D Secure (Email)')} style={{ margin: 0 }}>3D Secure (Email)</button>
+            </div>
+            <button className="text-button" onClick={() => setStepUpModalCase(null)}>Cancel</button>
+            <button className="icon-button" style={{ position: 'absolute', top: '16px', right: '16px' }} onClick={() => setStepUpModalCase(null)}><Icon name="close" size={16} /></button>
+          </div>
+        </div>
+      )}
+
+      {fraudConfirmModalCase && (
+        <div className="drawer-backdrop" style={{ zIndex: 50, alignItems: 'center', justifyContent: 'center' }}>
+          <div className="panel" style={{ width: '400px', padding: '24px', animation: 'drawer-in 0.2s ease', position: 'relative' }}>
+            <h3 style={{ margin: '0 0 10px', fontSize: '16px', color: 'var(--coral)' }}>Confirm Fraud</h3>
+            <p style={{ color: 'var(--muted)', fontSize: '12px', marginBottom: '20px', lineHeight: 1.5 }}>
+              You are about to flag this transaction as confirmed fraud. Would you like to immediately lock the card ending in <strong>{fraudConfirmModalCase.card.split('-').pop()}</strong> to prevent further losses?
+            </p>
+            <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end' }}>
+              <button className="clear-button" style={{ margin: 0, width: 'auto', padding: '0 16px' }} onClick={() => submitFraudConfirm(false)}>Skip & Confirm</button>
+              <button className="danger-button" style={{ margin: 0, width: 'auto', padding: '0 16px' }} onClick={() => submitFraudConfirm(true)}>Lock Card & Confirm</button>
+            </div>
+            <button className="icon-button" style={{ position: 'absolute', top: '16px', right: '16px' }} onClick={() => setFraudConfirmModalCase(null)}><Icon name="close" size={16} /></button>
+          </div>
+        </div>
+      )}
+
       {toast && <div className="toast"><span className="toast-icon"><Icon name="check" size={14} /></span><span>{toast}</span><button onClick={() => setToast('')} aria-label="Dismiss notification"><Icon name="close" size={13} /></button></div>}
     </div>
   )
