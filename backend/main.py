@@ -1,7 +1,7 @@
 """FraudOps API (Render). Serves the processed dataset and records analyst actions as an audit trail."""
 import json, os, sqlite3, time
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
@@ -23,7 +23,7 @@ def db():
     return c
 
 class Action(BaseModel):
-    action: str; status: str; detail: str = ""; actor: str = "analyst"; feedback: str | None = None
+    action: str; status: str; detail: str = ""; actor: str = "analyst"; feedback: str | None = None; role: str = ""
 
 @app.get("/health")
 def health(): return {"ok": True, "rows": len(dataset["transactions"])}
@@ -33,6 +33,14 @@ def get_dataset(): return dataset
 
 @app.post("/api/cases/{case_id}/action")
 def case_action(case_id: str, a: Action):
+    # RBAC Validation
+    if a.action == 'Card locked' and a.role != 'Admin':
+        raise HTTPException(status_code=403, detail="Requires Admin role to lock card")
+    if a.action in ['Step-up requested', 'Alert cleared'] and a.role not in ['L2 Analyst', 'Admin']:
+        raise HTTPException(status_code=403, detail=f"Requires L2 Analyst or Admin role for {a.action}")
+    if a.action == 'Analyst feedback' and a.feedback == 'Confirmed fraud' and a.role not in ['L2 Analyst', 'Admin']:
+        raise HTTPException(status_code=403, detail="Requires L2 Analyst or Admin role to confirm fraud")
+
     with db() as c:
         c.execute("INSERT INTO audit(ts,case_id,action,status,detail,actor,feedback) VALUES(?,?,?,?,?,?,?)",
                   (time.time(), case_id, a.action, a.status, a.detail, a.actor, a.feedback))
